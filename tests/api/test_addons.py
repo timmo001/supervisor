@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import PurePath
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import aiodocker
 from aiodocker.containers import DockerContainer
@@ -21,6 +21,7 @@ from supervisor.docker.const import ContainerState
 from supervisor.docker.manager import CommandReturn
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import HassioError
+from supervisor.homeassistant.const import WSEvent, WSType
 from supervisor.store.repository import Repository
 
 from ..const import TEST_ADDON_SLUG
@@ -36,12 +37,17 @@ def _create_test_event(name: str, state: ContainerState) -> DockerContainerState
     )
 
 
-async def test_addons_info(api_client: TestClient, install_addon_ssh: Addon):
+async def test_addons_info(
+    api_client: TestClient, install_addon_ssh: Addon, ha_ws_client: AsyncMock
+):
     """Test getting addon info."""
     install_addon_ssh.state = AddonState.STOPPED
     install_addon_ssh.ingress_panel = True
     install_addon_ssh.protected = True
     install_addon_ssh.watchdog = False
+
+    await asyncio.sleep(0)
+    ha_ws_client.async_send_command.reset_mock()
 
     resp = await api_client.get(f"/addons/{TEST_ADDON_SLUG}/info")
     result = await resp.json()
@@ -51,6 +57,17 @@ async def test_addons_info(api_client: TestClient, install_addon_ssh: Addon):
     assert result["data"]["ingress_panel"] is True
     assert result["data"]["protected"] is True
     assert result["data"]["watchdog"] is False
+
+    await asyncio.sleep(0)
+    assert any(
+        call.args[0]["type"] == WSType.SUPERVISOR_EVENT
+        and call.args[0]["data"]["event"] == WSEvent.ADDON
+        and call.args[0]["data"]["slug"] == TEST_ADDON_SLUG
+        and call.args[0]["data"]["state"] == AddonState.STOPPED
+        and call.args[0]["data"]["update_key"] == "info"
+        and call.args[0]["data"]["data"]["version"] == "9.2.1"
+        for call in ha_ws_client.async_send_command.call_args_list
+    )
 
 
 # DEPRECATED - Remove with legacy routing logic on 1/2023

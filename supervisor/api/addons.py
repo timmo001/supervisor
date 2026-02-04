@@ -1,7 +1,7 @@
 """Init file for Supervisor Home Assistant RESTful API."""
 
 import asyncio
-from collections.abc import Awaitable
+from copy import deepcopy
 import logging
 from typing import Any, TypedDict
 
@@ -28,6 +28,7 @@ from ..const import (
     ATTR_BUILD,
     ATTR_CHANGELOG,
     ATTR_CPU_PERCENT,
+    ATTR_DATA,
     ATTR_DESCRIPTON,
     ATTR_DETACHED,
     ATTR_DEVICES,
@@ -86,6 +87,7 @@ from ..const import (
     ATTR_UART,
     ATTR_UDEV,
     ATTR_UPDATE_AVAILABLE,
+    ATTR_UPDATE_KEY,
     ATTR_URL,
     ATTR_USB,
     ATTR_VERSION,
@@ -110,6 +112,7 @@ from ..exceptions import (
     PwnedError,
     PwnedSecret,
 )
+from ..homeassistant.const import WSEvent
 from ..validate import docker_ports
 from .const import ATTR_BOOT_CONFIG, ATTR_REMOVE_CONFIG, ATTR_SIGNED
 from .utils import api_process, api_validate, json_loads
@@ -160,64 +163,38 @@ class OptionsValidateResponse(TypedDict):
 class APIAddons(CoreSysAttributes):
     """Handle RESTful API for add-on functions."""
 
-    def get_addon_for_request(self, request: web.Request) -> Addon:
-        """Return addon, throw an exception if it doesn't exist."""
-        addon_slug: str = request.match_info["addon"]
+    def __init__(self) -> None:
+        """Initialize add-on API helper."""
+        self._addon_info_cache: dict[str, dict[str, Any]] = {}
 
-        # Lookup itself
-        if addon_slug == "self":
-            addon = request.get(REQUEST_FROM)
-            if not isinstance(addon, Addon):
-                raise APIError("Self is not an Addon")
-            return addon
+    def _normalize_addon_info(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize add-on info for stable comparisons."""
+        if (devices := data.get(ATTR_DEVICES)) is not None:
+            data[ATTR_DEVICES] = sorted(str(device) for device in devices)
+        if (services := data.get(ATTR_SERVICES)) is not None:
+            data[ATTR_SERVICES] = sorted(services)
+        return data
 
-        addon = self.sys_addons.get(addon_slug)
-        if not addon:
-            raise APINotFound(f"Addon {addon_slug} does not exist")
-        if not isinstance(addon, Addon) or not addon.is_installed:
-            raise APIAddonNotInstalled("Addon is not installed")
+    def _emit_addon_info(self, addon: Addon, data: dict[str, Any]) -> None:
+        """Emit add-on info updates to Home Assistant."""
+        normalized = self._normalize_addon_info(deepcopy(data))
+        if self._addon_info_cache.get(addon.slug) == normalized:
+            return
 
-        return addon
-
-    @api_process
-    async def list_addons(self, request: web.Request) -> dict[str, Any]:
-        """Return all add-ons or repositories."""
-        data_addons = [
+        self._addon_info_cache[addon.slug] = normalized
+        self.sys_homeassistant.websocket.supervisor_event_custom(
+            WSEvent.ADDON,
             {
-                ATTR_NAME: addon.name,
                 ATTR_SLUG: addon.slug,
-                ATTR_DESCRIPTON: addon.description,
-                ATTR_ADVANCED: addon.advanced,
-                ATTR_STAGE: addon.stage,
-                ATTR_VERSION: addon.version,
-                ATTR_VERSION_LATEST: addon.latest_version,
-                ATTR_UPDATE_AVAILABLE: addon.need_update,
-                ATTR_AVAILABLE: addon.available,
-                ATTR_DETACHED: addon.is_detached,
-                ATTR_HOMEASSISTANT: addon.homeassistant_version,
                 ATTR_STATE: addon.state,
-                ATTR_REPOSITORY: addon.repository,
-                ATTR_BUILD: addon.need_build,
-                ATTR_URL: addon.url,
-                ATTR_ICON: addon.with_icon,
-                ATTR_LOGO: addon.with_logo,
-                ATTR_SYSTEM_MANAGED: addon.system_managed,
-            }
-            for addon in self.sys_addons.installed
-        ]
+                ATTR_UPDATE_KEY: "info",
+                ATTR_DATA: data,
+            },
+        )
 
-        return {ATTR_ADDONS: data_addons}
-
-    @api_process
-    async def reload(self, request: web.Request) -> None:
-        """Reload all add-on data from store."""
-        await asyncio.shield(self.sys_store.reload())
-
-    async def info(self, request: web.Request) -> dict[str, Any]:
-        """Return add-on information."""
-        addon: Addon = self.get_addon_for_request(request)
-
-        data = {
+    async def _get_addon_info_data(self, addon: Addon) -> dict[str, Any]:
+        """Build add-on info payload."""
+        return {
             ATTR_NAME: addon.name,
             ATTR_SLUG: addon.slug,
             ATTR_HOSTNAME: addon.hostname,
@@ -294,6 +271,70 @@ class APIAddons(CoreSysAttributes):
             ATTR_SYSTEM_MANAGED_CONFIG_ENTRY: addon.system_managed_config_entry,
         }
 
+    async def _emit_addon_info_update(self, addon: Addon) -> None:
+        """Emit add-on info updates for the addon."""
+        data = await self._get_addon_info_data(addon)
+        self._emit_addon_info(addon, data)
+
+    def get_addon_for_request(self, request: web.Request) -> Addon:
+        """Return addon, throw an exception if it doesn't exist."""
+        addon_slug: str = request.match_info["addon"]
+
+        # Lookup itself
+        if addon_slug == "self":
+            addon = request.get(REQUEST_FROM)
+            if not isinstance(addon, Addon):
+                raise APIError("Self is not an Addon")
+            return addon
+
+        addon = self.sys_addons.get(addon_slug)
+        if not addon:
+            raise APINotFound(f"Addon {addon_slug} does not exist")
+        if not isinstance(addon, Addon) or not addon.is_installed:
+            raise APIAddonNotInstalled("Addon is not installed")
+
+        return addon
+
+    @api_process
+    async def list_addons(self, request: web.Request) -> dict[str, Any]:
+        """Return all add-ons or repositories."""
+        data_addons = [
+            {
+                ATTR_NAME: addon.name,
+                ATTR_SLUG: addon.slug,
+                ATTR_DESCRIPTON: addon.description,
+                ATTR_ADVANCED: addon.advanced,
+                ATTR_STAGE: addon.stage,
+                ATTR_VERSION: addon.version,
+                ATTR_VERSION_LATEST: addon.latest_version,
+                ATTR_UPDATE_AVAILABLE: addon.need_update,
+                ATTR_AVAILABLE: addon.available,
+                ATTR_DETACHED: addon.is_detached,
+                ATTR_HOMEASSISTANT: addon.homeassistant_version,
+                ATTR_STATE: addon.state,
+                ATTR_REPOSITORY: addon.repository,
+                ATTR_BUILD: addon.need_build,
+                ATTR_URL: addon.url,
+                ATTR_ICON: addon.with_icon,
+                ATTR_LOGO: addon.with_logo,
+                ATTR_SYSTEM_MANAGED: addon.system_managed,
+            }
+            for addon in self.sys_addons.installed
+        ]
+
+        return {ATTR_ADDONS: data_addons}
+
+    @api_process
+    async def reload(self, request: web.Request) -> None:
+        """Reload all add-on data from store."""
+        await asyncio.shield(self.sys_store.reload())
+
+    async def info(self, request: web.Request) -> dict[str, Any]:
+        """Return add-on information."""
+        addon: Addon = self.get_addon_for_request(request)
+
+        data = await self._get_addon_info_data(addon)
+        self._emit_addon_info(addon, data)
         return data
 
     @api_process
@@ -339,6 +380,7 @@ class APIAddons(CoreSysAttributes):
             addon.watchdog = body[ATTR_WATCHDOG]
 
         await addon.save_persist()
+        await self._emit_addon_info_update(addon)
 
     @api_process
     async def sys_options(self, request: web.Request) -> None:
@@ -353,6 +395,7 @@ class APIAddons(CoreSysAttributes):
             addon.system_managed_config_entry = body[ATTR_SYSTEM_MANAGED_CONFIG_ENTRY]
 
         await addon.save_persist()
+        await self._emit_addon_info_update(addon)
 
     @api_process
     async def options_validate(self, request: web.Request) -> OptionsValidateResponse:
@@ -419,6 +462,7 @@ class APIAddons(CoreSysAttributes):
             addon.protected = body[ATTR_PROTECTED]
 
         await addon.save_persist()
+        await self._emit_addon_info_update(addon)
 
     @api_process
     async def stats(self, request: web.Request) -> dict[str, Any]:
@@ -455,12 +499,14 @@ class APIAddons(CoreSysAttributes):
         addon = self.get_addon_for_request(request)
         if start_task := await asyncio.shield(addon.start()):
             await start_task
+        await self._emit_addon_info_update(addon)
 
     @api_process
-    def stop(self, request: web.Request) -> Awaitable[None]:
+    async def stop(self, request: web.Request) -> None:
         """Stop add-on."""
         addon = self.get_addon_for_request(request)
-        return asyncio.shield(addon.stop())
+        await asyncio.shield(addon.stop())
+        await self._emit_addon_info_update(addon)
 
     @api_process
     async def restart(self, request: web.Request) -> None:
@@ -468,6 +514,7 @@ class APIAddons(CoreSysAttributes):
         addon: Addon = self.get_addon_for_request(request)
         if start_task := await asyncio.shield(addon.restart()):
             await start_task
+        await self._emit_addon_info_update(addon)
 
     @api_process
     async def rebuild(self, request: web.Request) -> None:
@@ -479,6 +526,7 @@ class APIAddons(CoreSysAttributes):
             self.sys_addons.rebuild(addon.slug, force=body[ATTR_FORCE])
         ):
             await start_task
+        await self._emit_addon_info_update(addon)
 
     @api_process
     async def stdin(self, request: web.Request) -> None:
