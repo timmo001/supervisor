@@ -186,7 +186,7 @@ class APIAddons(CoreSysAttributes):
             WSEvent.ADDON,
             {
                 ATTR_SLUG: addon.slug,
-                ATTR_STATE: addon.state,
+                ATTR_STATE: data[ATTR_STATE],
                 ATTR_UPDATE_KEY: "info",
                 ATTR_DATA: data,
             },
